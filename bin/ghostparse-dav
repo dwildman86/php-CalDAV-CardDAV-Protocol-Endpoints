@@ -1,0 +1,155 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+use GhostParse\Dav\Backend\Pdo\PdoUserBackend;
+use GhostParse\Dav\Schema\Schema;
+
+foreach ([__DIR__ . '/../vendor/autoload.php', __DIR__ . '/../../../autoload.php'] as $autoload) {
+    if (is_file($autoload)) {
+        require $autoload;
+        break;
+    }
+}
+
+if (!class_exists(Schema::class)) {
+    fwrite(STDERR, "Unable to locate the Composer autoloader. Run `composer install` first.\n");
+    exit(1);
+}
+
+$usage = <<<'TXT'
+GhostParse CalDAV/CardDAV administration
+
+Usage:
+  ghostparse-dav schema:install  --dsn=DSN [--db-user=USER] [--db-password=PASS] [--prefix=PREFIX]
+  ghostparse-dav schema:dump     --driver=sqlite|mysql|pgsql [--prefix=PREFIX]
+  ghostparse-dav user:add        USERNAME --dsn=DSN [--name=NAME] [--email=EMAIL] [--password=PASS]
+  ghostparse-dav user:passwd     USERNAME --dsn=DSN [--password=PASS]
+  ghostparse-dav user:delete     USERNAME --dsn=DSN
+  ghostparse-dav user:list       --dsn=DSN
+
+When --password is omitted you will be prompted for it.
+Database credentials may also be supplied through the DAV_DB_USER and DAV_DB_PASSWORD environment variables.
+
+Examples:
+  ghostparse-dav schema:install --dsn="sqlite:/var/lib/dav/dav.sqlite"
+  ghostparse-dav user:add alice --dsn="mysql:host=localhost;dbname=dav" --db-user=dav --email=alice@example.com
+
+TXT;
+
+$args = array_slice($argv, 1);
+$command = array_shift($args);
+$options = [];
+$positional = [];
+foreach ($args as $arg) {
+    if (preg_match('/^--([a-z-]+)(?:=(.*))?$/', $arg, $m)) {
+        $options[$m[1]] = $m[2] ?? '1';
+    } else {
+        $positional[] = $arg;
+    }
+}
+
+$fail = static function (string $message) use ($usage): never {
+    fwrite(STDERR, $message . "\n\n" . $usage);
+    exit(1);
+};
+
+$connect = static function () use ($options, $fail): PDO {
+    if (!isset($options['dsn'])) {
+        $fail('Missing --dsn option.');
+    }
+    $user = $options['db-user'] ?? (getenv('DAV_DB_USER') ?: null);
+    $password = $options['db-password'] ?? (getenv('DAV_DB_PASSWORD') ?: null);
+
+    return new PDO($options['dsn'], $user, $password, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+};
+
+$askPassword = static function () use ($options): string {
+    if (isset($options['password'])) {
+        return $options['password'];
+    }
+    $interactive = function_exists('posix_isatty') ? posix_isatty(STDIN) : true;
+    $read = static function (string $prompt) use ($interactive): string {
+        fwrite(STDERR, $prompt);
+        if ($interactive && DIRECTORY_SEPARATOR === '/') {
+            shell_exec('stty -echo 2>/dev/null');
+        }
+        $value = rtrim((string) fgets(STDIN), "\r\n");
+        if ($interactive && DIRECTORY_SEPARATOR === '/') {
+            shell_exec('stty echo 2>/dev/null');
+            fwrite(STDERR, "\n");
+        }
+
+        return $value;
+    };
+    $password = $read('Password: ');
+    if ($interactive && $read('Repeat password: ') !== $password) {
+        fwrite(STDERR, "Passwords do not match.\n");
+        exit(1);
+    }
+    if ($password === '') {
+        fwrite(STDERR, "Password must not be empty.\n");
+        exit(1);
+    }
+
+    return $password;
+};
+
+try {
+    switch ($command) {
+        case 'schema:install':
+            Schema::install($connect(), $options['prefix'] ?? '');
+            echo "Schema installed.\n";
+            break;
+
+        case 'schema:dump':
+            echo Schema::dump($options['driver'] ?? $fail('Missing --driver option.'), $options['prefix'] ?? '');
+            break;
+
+        case 'user:add':
+            $username = $positional[0] ?? $fail('Missing USERNAME.');
+            $users = new PdoUserBackend($connect(), $options['prefix'] ?? '');
+            if ($users->userExists($username)) {
+                $fail(sprintf('User "%s" already exists.', $username));
+            }
+            $users->createUser($username, $askPassword(), $options['name'] ?? null, $options['email'] ?? null);
+            echo "User \"$username\" created.\n";
+            break;
+
+        case 'user:passwd':
+            $username = $positional[0] ?? $fail('Missing USERNAME.');
+            $users = new PdoUserBackend($connect(), $options['prefix'] ?? '');
+            if (!$users->userExists($username)) {
+                $fail(sprintf('User "%s" does not exist.', $username));
+            }
+            $users->setPassword($username, $askPassword());
+            echo "Password updated.\n";
+            break;
+
+        case 'user:delete':
+            $username = $positional[0] ?? $fail('Missing USERNAME.');
+            (new PdoUserBackend($connect(), $options['prefix'] ?? ''))->deleteUser($username);
+            echo "User \"$username\" deleted (calendars and address books are kept).\n";
+            break;
+
+        case 'user:list':
+            foreach ((new PdoUserBackend($connect(), $options['prefix'] ?? ''))->listUsers() as $username) {
+                echo $username, "\n";
+            }
+            break;
+
+        case null:
+        case 'help':
+        case '--help':
+        case '-h':
+            echo $usage;
+            break;
+
+        default:
+            $fail(sprintf('Unknown command "%s".', $command));
+    }
+} catch (Throwable $e) {
+    fwrite(STDERR, 'Error: ' . $e->getMessage() . "\n");
+    exit(1);
+}
